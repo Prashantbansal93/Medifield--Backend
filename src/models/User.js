@@ -22,7 +22,10 @@ const UserSchema = new mongoose.Schema({
     licenseNumber: String,
     gstNumber: String,
     profileImageUrl: String,
+    /** @deprecated prefer aadhaarImageUrl + shopLicenseImageUrl */
     documentUrls: [String],
+    aadhaarImageUrl: String,
+    shopLicenseImageUrl: String,
     vehicleType: String,
     vehicleNumber: String,
     drivingLicenseNumber: String,
@@ -32,6 +35,7 @@ const UserSchema = new mongoose.Schema({
     lng: Number,
     adminCode: String,
   },
+  phoneVerifiedAt: { type: Date, default: null },
   refreshTokenHash: { type: String, select: false },
   refreshTokenExpiresAt: { type: Date, select: false },
   createdAt: { type: Date, default: Date.now },
@@ -40,5 +44,6 @@ const UserSchema = new mongoose.Schema({
 UserSchema.index({ role: 1, verificationStatus: 1 });
 UserSchema.index({ 'profile.city': 1, role: 1 });
 UserSchema.index({ refreshTokenHash: 1 });
+UserSchema.index({ phone: 1 });
 
 module.exports = mongoose.model('User', UserSchema);

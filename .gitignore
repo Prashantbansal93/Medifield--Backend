@@ -8,3 +8,5 @@ coverage/
 .cursorignore
 .vscode/
 *.code-workspace
+uploads/
+!uploads/.gitkeep

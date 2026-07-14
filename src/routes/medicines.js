@@ -5,6 +5,53 @@ const { auth, requireRole, requireVerified } = require('../middleware/auth');
 
 const router = express.Router();
 
+router.get('/suggest', auth, requireVerified, async (req, res) => {
+  try {
+    const limit = Math.min(12, Math.max(4, Number(req.query.limit) || 8));
+    const total = await Medicine.countDocuments();
+    const skip = total > limit ? Math.floor(Math.random() * Math.max(1, total - limit)) : 0;
+    const medicines = await Medicine.find().skip(skip).limit(limit);
+
+    const wholesalerMatches = await Wholesaler.find({
+      'inventory.medicine': { $in: medicines.map((m) => m._id) },
+      'inventory.quantity': { $gt: 0 },
+    });
+
+    const stockIds = new Set();
+    for (const w of wholesalerMatches) {
+      for (const inv of w.inventory || []) {
+        if (inv.quantity > 0 && inv.medicine) stockIds.add(String(inv.medicine));
+      }
+    }
+
+    const result = medicines.map((med) => {
+      const vendors = wholesalerMatches
+        .map((w) => {
+          const inv = (w.inventory || []).find(
+            (i) => i.medicine && String(i.medicine) === String(med._id) && i.quantity > 0
+          );
+          if (!inv) return null;
+          return { price: inv.price, quantity: inv.quantity };
+        })
+        .filter(Boolean);
+      return {
+        id: med._id,
+        name: med.name,
+        company: med.company,
+        category: med.category,
+        imageUrl: med.imageUrl || '',
+        requiresPrescription: med.requiresPrescription,
+        price: vendors[0]?.price || med.mrp,
+        available: stockIds.has(String(med._id)) || vendors.length > 0,
+      };
+    });
+
+    return res.json({ success: true, medicines: result });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message || 'Suggestions failed' });
+  }
+});
+
 router.get('/search', auth, requireVerified, async (req, res) => {
   try {
     const q = String(req.query.q || '').trim();

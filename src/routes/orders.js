@@ -8,7 +8,9 @@ const { auth, requireRole, requireVerified } = require('../middleware/auth');
 const { canTransitionStatus } = require('../utils/validation');
 const { emitOrderEvent } = require('../realtime');
 const { withTransaction } = require('../utils/transactions');
-const { notifyOrderEvent } = require('../utils/notifications');
+const { notifyOrderEvent, createNotification } = require('../utils/notifications');
+const { resolveDeliverySlot } = require('../utils/deliverySlots');
+const { challanUpload, publicUploadPath } = require('../middleware/upload');
 const {
   randomOtp,
   generateBillNumber,
@@ -23,7 +25,10 @@ const {
 
 const waitMinutes = Number(process.env.WHOLESALER_WAIT_MINUTES) || 5;
 
-const CANCELLABLE_STATUSES = ['PLACED', 'WAITING_WHOLESALER', 'ACCEPTED', 'PACKED'];
+/** Free cancel only before wholesaler accepts */
+const FREE_CANCEL_STATUSES = ['PLACED', 'WAITING_WHOLESALER'];
+/** After accept, retailer may only request cancel (until picked up) */
+const CANCEL_REQUEST_STATUSES = ['ACCEPTED', 'PACKED'];
 const STOCK_RESTORE_STATUSES = ['ACCEPTED', 'PACKED'];
 
 function serializeOrder(order, isRetailer) {
@@ -32,15 +37,19 @@ function serializeOrder(order, isRetailer) {
   return obj;
 }
 
+router.get('/delivery-slot', auth, requireRole('RETAILER'), requireVerified, (req, res) => {
+  return res.json({ success: true, deliverySlot: resolveDeliverySlot() });
+});
+
 router.post('/create', auth, requireRole('RETAILER'), requireVerified, async (req, res) => {
   try {
-    const { items, slot = 'Afternoon' } = req.body;
+    const { items } = req.body;
     if (!Array.isArray(items) || !items.length) {
       return res.status(400).json({ success: false, message: 'Order must include at least one item' });
     }
-    if (!['Afternoon', 'Evening'].includes(slot)) {
-      return res.status(400).json({ success: false, message: 'Slot must be Afternoon or Evening' });
-    }
+
+    const deliverySlot = resolveDeliverySlot();
+    const slot = deliverySlot.slot;
 
     const medicineIds = items.map((i) => i.medicineId);
     const medicines = await Medicine.find({ _id: { $in: medicineIds } });
@@ -72,9 +81,12 @@ router.post('/create', auth, requireRole('RETAILER'), requireVerified, async (re
       retailer: req.user.id,
       status: 'WAITING_WHOLESALER',
       slot,
+      slotWindowLabel: deliverySlot.windowLabel,
+      deliveryDateLabel: deliverySlot.deliveryDateLabel,
       wholesalerResponseDeadline: new Date(Date.now() + waitMinutes * 60 * 1000),
       totalAmount: normalizedItems.reduce((acc, item) => acc + item.price * item.quantity, 0),
       items: normalizedItems,
+      cancelRequest: { status: 'NONE' },
     });
 
     const selectedWholesaler = await routeToWholesaler(order);
@@ -96,6 +108,7 @@ router.post('/create', auth, requireRole('RETAILER'), requireVerified, async (re
       success: true,
       message: 'Order routed to nearest wholesaler. Waiting for accept/reject.',
       order: serialized,
+      deliverySlot,
       waitWindowMinutes: waitMinutes,
     });
   } catch (err) {
@@ -185,39 +198,198 @@ router.post('/respond', auth, requireRole('WHOLESALER'), requireVerified, async 
 
 router.post('/cancel', auth, requireRole('RETAILER'), requireVerified, async (req, res) => {
   try {
-    const { orderId } = req.body;
+    const { orderId, reason } = req.body;
     const order = await Order.findById(orderId);
     if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
     if (String(order.retailer) !== String(req.user.id)) {
       return res.status(403).json({ success: false, message: 'You can only cancel your own orders' });
     }
-    if (!CANCELLABLE_STATUSES.includes(order.status)) {
-      return res.status(400).json({
-        success: false,
-        message: `Cannot cancel order in ${order.status} status. Cancellation allowed before pickup.`,
+
+    if (FREE_CANCEL_STATUSES.includes(order.status)) {
+      await Order.findByIdAndUpdate(orderId, {
+        status: 'CANCELLED',
+        cancelledAt: new Date(),
+        deliveryPartner: null,
+        cancelRequest: { status: 'NONE' },
+      });
+
+      const live = await hydrateOrder(orderId);
+      const serialized = serializeOrder(live, true);
+      emitOrderEvent('order:updated', serialized);
+      await notifyOrderEvent(live, 'CANCELLED', 'Retailer cancelled the order before wholesaler acceptance.');
+      return res.json({
+        success: true,
+        mode: 'cancelled',
+        message: 'Order cancelled successfully',
+        order: serialized,
       });
     }
 
-    const shouldRestore = order.stockDeducted || STOCK_RESTORE_STATUSES.includes(order.status);
+    if (!CANCEL_REQUEST_STATUSES.includes(order.status)) {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot cancel order in ${order.status} status.`,
+      });
+    }
 
+    if (order.cancelRequest?.status === 'PENDING') {
+      return res.status(400).json({
+        success: false,
+        message: 'A cancel request is already pending wholesaler approval.',
+        order: serializeOrder(await hydrateOrder(orderId), true),
+      });
+    }
+
+    await Order.findByIdAndUpdate(orderId, {
+      cancelRequest: {
+        status: 'PENDING',
+        requestedAt: new Date(),
+        reason: reason ? String(reason).slice(0, 300) : 'Retailer requested cancellation',
+      },
+    });
+
+    const live = await hydrateOrder(orderId);
+    const serialized = serializeOrder(live, true);
+    emitOrderEvent('order:updated', serialized);
+    await notifyOrderEvent(live, 'CANCEL_REQUESTED', 'Retailer requested order cancellation.');
+    return res.json({
+      success: true,
+      mode: 'request',
+      message: 'Cancel request sent. Waiting for wholesaler approval.',
+      order: serialized,
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message || 'Cancellation failed' });
+  }
+});
+
+router.post('/cancel-respond', auth, requireRole('WHOLESALER'), requireVerified, async (req, res) => {
+  try {
+    const { orderId, action } = req.body;
+    if (!['approve', 'reject'].includes(action)) {
+      return res.status(400).json({ success: false, message: 'action must be approve or reject' });
+    }
+
+    const userWholesaler = await Wholesaler.findOne({ user: req.user.id });
+    if (!userWholesaler) {
+      return res.status(404).json({ success: false, message: 'Wholesaler profile not found' });
+    }
+
+    const order = await Order.findById(orderId);
+    if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
+    if (!order.wholesaler || String(order.wholesaler) !== String(userWholesaler._id)) {
+      return res.status(403).json({ success: false, message: 'Order is not assigned to you' });
+    }
+    if (order.cancelRequest?.status !== 'PENDING') {
+      return res.status(400).json({ success: false, message: 'No pending cancel request on this order' });
+    }
+
+    if (action === 'reject') {
+      await Order.findByIdAndUpdate(orderId, {
+        cancelRequest: {
+          status: 'REJECTED',
+          requestedAt: order.cancelRequest.requestedAt,
+          resolvedAt: new Date(),
+          reason: order.cancelRequest.reason,
+        },
+      });
+      const live = await hydrateOrder(orderId);
+      const serialized = serializeOrder(live, false);
+      emitOrderEvent('order:updated', serialized);
+      await createNotification({
+        userId: order.retailer,
+        type: 'ORDER_CANCEL_REJECTED',
+        title: 'Cancel request declined',
+        message: 'Wholesaler declined your cancellation request. The order continues.',
+        orderId: order._id,
+      });
+      return res.json({ success: true, message: 'Cancel request rejected', order: serialized });
+    }
+
+    const shouldRestore = order.stockDeducted || STOCK_RESTORE_STATUSES.includes(order.status);
     await withTransaction(async (session) => {
       if (shouldRestore && order.wholesaler) {
         await restoreInventory(order.wholesaler, order.items, session);
       }
       await Order.findByIdAndUpdate(
         orderId,
-        { status: 'CANCELLED', cancelledAt: new Date(), deliveryPartner: null },
+        {
+          status: 'CANCELLED',
+          cancelledAt: new Date(),
+          deliveryPartner: null,
+          cancelRequest: {
+            status: 'APPROVED',
+            requestedAt: order.cancelRequest.requestedAt,
+            resolvedAt: new Date(),
+            reason: order.cancelRequest.reason,
+          },
+        },
         { session }
       );
     });
 
     const live = await hydrateOrder(orderId);
-    const serialized = serializeOrder(live, true);
+    const serialized = serializeOrder(live, false);
     emitOrderEvent('order:updated', serialized);
-    await notifyOrderEvent(live, 'CANCELLED', 'Retailer cancelled the order.');
-    return res.json({ success: true, message: 'Order cancelled successfully', order: serialized });
+    await notifyOrderEvent(live, 'CANCELLED', 'Wholesaler approved cancel request.');
+    await createNotification({
+      userId: order.retailer,
+      type: 'ORDER_CANCEL_APPROVED',
+      title: 'Order cancelled',
+      message: 'Your cancel request was approved. See cancel bill in past orders.',
+      orderId: order._id,
+    });
+    return res.json({
+      success: true,
+      message: 'Cancel request approved. Order cancelled and stock restored.',
+      order: serialized,
+      cancelBill: {
+        billNumber: live.billNumber,
+        totalAmount: live.totalAmount,
+        cancelledAt: live.cancelledAt,
+        status: 'CANCELLED',
+      },
+    });
   } catch (err) {
-    return res.status(500).json({ success: false, message: err.message || 'Cancellation failed' });
+    return res.status(500).json({ success: false, message: err.message || 'Cancel response failed' });
+  }
+});
+
+router.post('/upload-challan', auth, requireRole('WHOLESALER'), requireVerified, (req, res, next) => {
+  challanUpload.single('challanImage')(req, res, (err) => {
+    if (err) return res.status(400).json({ success: false, message: err.message || 'Upload failed' });
+    return next();
+  });
+}, async (req, res) => {
+  try {
+    const orderId = req.body.orderId;
+    if (!orderId) return res.status(400).json({ success: false, message: 'orderId is required' });
+    if (!req.file) return res.status(400).json({ success: false, message: 'challanImage file is required' });
+
+    const userWholesaler = await Wholesaler.findOne({ user: req.user.id });
+    if (!userWholesaler) {
+      return res.status(404).json({ success: false, message: 'Wholesaler profile not found' });
+    }
+
+    const order = await Order.findById(orderId);
+    if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
+    if (String(order.wholesaler) !== String(userWholesaler._id)) {
+      return res.status(403).json({ success: false, message: 'Order is not assigned to you' });
+    }
+
+    const url = publicUploadPath(req.file.path);
+    await Order.findByIdAndUpdate(orderId, { offlineChallanImageUrl: url });
+    const live = await hydrateOrder(orderId);
+    const serialized = serializeOrder(live, false);
+    emitOrderEvent('order:updated', serialized);
+    return res.json({
+      success: true,
+      message: 'Offline challan uploaded',
+      order: serialized,
+      offlineChallanImageUrl: url,
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message || 'Challan upload failed' });
   }
 });
 

@@ -34,49 +34,60 @@ function isValidUrl(url) {
   }
 }
 
+function isUploadOrHttpUrl(url) {
+  const value = String(url || '').trim();
+  if (!value) return false;
+  if (value.startsWith('/uploads/')) return true;
+  return isValidUrl(value);
+}
+
+function normalizeVerificationDocuments(profile = {}) {
+  const next = { ...profile };
+  const aadhaarImageUrl = next.aadhaarImageUrl || (Array.isArray(next.documentUrls) ? next.documentUrls[0] : null);
+  const shopLicenseImageUrl =
+    next.shopLicenseImageUrl || (Array.isArray(next.documentUrls) ? next.documentUrls[1] : null);
+
+  if (aadhaarImageUrl) next.aadhaarImageUrl = String(aadhaarImageUrl).trim();
+  if (shopLicenseImageUrl) next.shopLicenseImageUrl = String(shopLicenseImageUrl).trim();
+
+  if (next.aadhaarImageUrl && next.shopLicenseImageUrl) {
+    next.documentUrls = [next.aadhaarImageUrl, next.shopLicenseImageUrl];
+  }
+  return next;
+}
+
 function validateRoleProfile(role, profile = {}) {
   const errors = [];
+  const normalized = normalizeVerificationDocuments(profile);
 
   if (role === 'RETAILER' || role === 'WHOLESALER') {
-    if (!profile.aadhaarNumber || !/^\d{12}$/.test(String(profile.aadhaarNumber))) {
+    if (!normalized.aadhaarNumber || !/^\d{12}$/.test(String(normalized.aadhaarNumber))) {
       errors.push('Aadhaar number must be 12 digits');
     }
-    if (!profile.shopAddress) errors.push('Shop address is required');
-    if (!profile.licenseNumber) errors.push('Shop license number is required');
-    if (!profile.city) errors.push('City is required');
-    if (!profile.documentUrls || !Array.isArray(profile.documentUrls) || profile.documentUrls.length < 2) {
-      errors.push('At least 2 document URLs are required');
-    } else if (!profile.documentUrls.every(isValidUrl)) {
-      errors.push('All document URLs must be valid http/https links');
+    if (!normalized.shopAddress) errors.push('Shop address is required');
+    if (!normalized.licenseNumber) errors.push('Shop license number is required');
+    if (!normalized.city) errors.push('City is required');
+    if (!normalized.aadhaarImageUrl || !isUploadOrHttpUrl(normalized.aadhaarImageUrl)) {
+      errors.push('Aadhaar card image is required');
+    }
+    if (!normalized.shopLicenseImageUrl || !isUploadOrHttpUrl(normalized.shopLicenseImageUrl)) {
+      errors.push('Shop licence image is required');
     }
   }
 
   if (role === 'WHOLESALER') {
-    if (!profile.shopName) errors.push('Shop name is required for wholesaler');
-    const lat = Number(profile.lat);
-    const lng = Number(profile.lng);
-    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
-      errors.push('Valid latitude and longitude are required for wholesaler');
-    }
-  }
-
-  if (role === 'RETAILER') {
-    const lat = Number(profile.lat);
-    const lng = Number(profile.lng);
-    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
-      errors.push('Valid latitude and longitude are required for retailer');
-    }
+    if (!normalized.shopName) errors.push('Shop name is required for wholesaler');
   }
 
   if (role === 'DELIVERY') {
-    if (!profile.vehicleType) errors.push('Vehicle type is required');
-    if (!profile.vehicleNumber) errors.push('Vehicle number is required');
-    if (!profile.drivingLicenseNumber) errors.push('Driving license number is required');
-    if (!profile.city) errors.push('City is required for delivery partner');
+    if (!normalized.vehicleType) errors.push('Vehicle type is required');
+    if (!normalized.vehicleNumber) errors.push('Vehicle number is required');
+    if (!normalized.drivingLicenseNumber) errors.push('Driving license number is required');
+    if (!normalized.city) errors.push('City is required for delivery partner');
   }
 
   if (role === 'ADMIN') {
-    if (!profile.adminCode) errors.push('Admin access code is required');
+    if (!normalized.adminCode) errors.push('Admin access code is required');
   }
 
   return errors;
@@ -103,6 +114,8 @@ module.exports = {
   isValidIndianMobile,
   isValidEmail,
   isValidUrl,
+  isUploadOrHttpUrl,
+  normalizeVerificationDocuments,
   validateRoleProfile,
   canTransitionStatus,
   ORDER_TRANSITIONS,

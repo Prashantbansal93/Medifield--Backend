@@ -18,6 +18,7 @@ const notificationRoutes = require('./routes/notifications');
 const { initRealtime } = require('./realtime');
 const { notFoundHandler, errorHandler } = require('./middleware/errorHandler');
 const { startWholesalerTimeoutJob } = require('./jobs/wholesalerTimeout');
+const { UPLOAD_ROOT } = require('./middleware/upload');
 
 dotenv.config();
 
@@ -40,20 +41,22 @@ mongoose
     process.exit(1);
   });
 
-app.use(helmet());
+app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 app.use(
   cors({
     origin: config.corsOrigin,
     credentials: true,
   })
 );
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '2mb' }));
 app.use(
   pinoHttp({
     logger,
     autoLogging: { ignore: (req) => req.url === '/health' },
   })
 );
+
+app.use('/uploads', express.static(UPLOAD_ROOT));
 
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -72,6 +75,9 @@ const authLimiter = rateLimit({
 app.use('/api/', apiLimiter);
 app.use('/api/auth/login', authLimiter);
 app.use('/api/auth/register', authLimiter);
+app.use('/api/auth/otp/send', authLimiter);
+app.use('/api/auth/forgot-password', authLimiter);
+app.use('/api/auth/reset-password', authLimiter);
 
 app.get('/health', (req, res) => {
   res.json({

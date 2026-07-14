@@ -11,7 +11,8 @@ const ORDER_EVENT_MAP = {
   DELIVERED: { type: 'ORDER_DELIVERED', title: 'Order delivered', roles: ['RETAILER', 'WHOLESALER', 'ADMIN'] },
   REJECTED: { type: 'ORDER_REJECTED', title: 'Order rejected', roles: ['RETAILER'] },
   FAILED: { type: 'ORDER_FAILED', title: 'Order failed', roles: ['RETAILER'] },
-  CANCELLED: { type: 'ORDER_CANCELLED', title: 'Order cancelled', roles: ['WHOLESALER', 'DELIVERY', 'ADMIN'] },
+  CANCELLED: { type: 'ORDER_CANCELLED', title: 'Order cancelled', roles: ['WHOLESALER', 'DELIVERY', 'ADMIN', 'RETAILER'] },
+  CANCEL_REQUESTED: { type: 'ORDER_CANCEL_REQUESTED', title: 'Cancel request', roles: ['WHOLESALER'] },
   REDIRECTED: { type: 'ORDER_REDIRECTED', title: 'Order redirected', roles: ['WHOLESALER', 'RETAILER'] },
 };
 

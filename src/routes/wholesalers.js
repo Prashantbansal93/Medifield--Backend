@@ -1,6 +1,7 @@
 const express = require('express');
 const Wholesaler = require('../models/Wholesaler');
 const Medicine = require('../models/Medicine');
+const User = require('../models/User');
 const { auth, requireRole, requireVerified } = require('../middleware/auth');
 
 const router = express.Router();
@@ -34,6 +35,9 @@ router.put('/profile', auth, requireRole('WHOLESALER'), requireVerified, async (
     if (city) wholesaler.city = String(city).trim();
     if (Number.isFinite(Number(lat)) && Number.isFinite(Number(lng))) {
       wholesaler.location = { type: 'Point', coordinates: [Number(lng), Number(lat)] };
+      await User.findByIdAndUpdate(req.user.id, {
+        $set: { 'profile.lat': Number(lat), 'profile.lng': Number(lng) },
+      });
     }
 
     await wholesaler.save();

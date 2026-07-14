@@ -80,7 +80,7 @@ router.put('/profile', auth, requireRole('RETAILER'), requireVerified, async (re
       }
     }
 
-    const restrictedFields = ['aadhaarNumber', 'licenseNumber', 'documentUrls'];
+    const restrictedFields = ['aadhaarNumber', 'licenseNumber', 'documentUrls', 'aadhaarImageUrl', 'shopLicenseImageUrl'];
     const attemptedRestricted = restrictedFields.filter((f) => profile[f] !== undefined);
     if (attemptedRestricted.length) {
       errors.push(
@@ -109,11 +109,11 @@ router.get('/orders/history', auth, requireRole('RETAILER'), requireVerified, as
     const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 10));
     const status = String(req.query.status || 'DELIVERED').toUpperCase();
 
-    const allowedStatuses = ['DELIVERED', 'REJECTED', 'FAILED', 'ALL'];
+    const allowedStatuses = ['DELIVERED', 'REJECTED', 'FAILED', 'CANCELLED', 'ALL'];
     if (!allowedStatuses.includes(status)) {
       return res.status(400).json({
         success: false,
-        message: 'status must be DELIVERED, REJECTED, FAILED, or ALL',
+        message: 'status must be DELIVERED, REJECTED, FAILED, CANCELLED, or ALL',
       });
     }
 
@@ -152,13 +152,13 @@ router.get('/orders/history/:orderId', auth, requireRole('RETAILER'), requireVer
     const order = await Order.findOne({
       _id: req.params.orderId,
       retailer: req.user.id,
-      status: 'DELIVERED',
+      status: { $in: ['DELIVERED', 'CANCELLED'] },
     })
       .populate('deliveryPartner', 'name phone')
       .populate('items.medicine', 'name company');
 
     if (!order) {
-      return res.status(404).json({ success: false, message: 'Delivered order bill not found' });
+      return res.status(404).json({ success: false, message: 'Order bill not found' });
     }
 
     return res.json({ success: true, bill: formatOrderBill(order) });
