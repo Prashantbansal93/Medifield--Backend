@@ -3,7 +3,7 @@ const jwt = require('jsonwebtoken');
 
 let ioRef = null;
 
-function initRealtime(httpServer, corsOrigin) {
+async function initRealtime(httpServer, corsOrigin) {
   const io = new Server(httpServer, {
     cors: {
       origin: corsOrigin || process.env.CORS_ORIGIN || 'http://localhost:3000',
@@ -11,6 +11,23 @@ function initRealtime(httpServer, corsOrigin) {
       credentials: true,
     },
   });
+
+  const redisUrl = process.env.REDIS_URL;
+  if (redisUrl) {
+    try {
+      const { createAdapter } = require('@socket.io/redis-adapter');
+      const { createClient } = require('redis');
+      const pubClient = createClient({ url: redisUrl });
+      const subClient = pubClient.duplicate();
+      await Promise.all([pubClient.connect(), subClient.connect()]);
+      io.adapter(createAdapter(pubClient, subClient));
+      console.log('[socket.io] Redis adapter enabled for multi-instance scaling');
+    } catch (err) {
+      console.warn('[socket.io] Redis adapter failed — using in-memory mode:', err.message);
+    }
+  } else {
+    console.log('[socket.io] REDIS_URL not set — using in-memory adapter (single instance)');
+  }
 
   io.use((socket, next) => {
     try {
@@ -48,4 +65,9 @@ function emitOrderEvent(event, order) {
   if (wholesalerUserId) ioRef.to(`user:${wholesalerUserId}`).emit(event, order);
 }
 
-module.exports = { initRealtime, emitOrderEvent };
+function emitNotification(userId, notification) {
+  if (!ioRef || !userId || !notification) return;
+  ioRef.to(`user:${userId}`).emit('notification:new', notification);
+}
+
+module.exports = { initRealtime, emitOrderEvent, emitNotification };

@@ -5,14 +5,17 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
+    "test": "jest --coverage --forceExit",
+    "lint": "eslint src scripts --max-warnings=0",
     "seed:demo": "node scripts/seedDemoData.js",
     "db:clear": "node scripts/clearDatabase.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "description": "",
+  "description": "Medifield pharmaceutical supply-chain API",
   "dependencies": {
+    "@socket.io/redis-adapter": "^8.3.0",
     "bcryptjs": "^3.0.3",
     "cors": "^2.8.6",
     "dotenv": "^17.3.1",
@@ -21,7 +24,22 @@
     "helmet": "^8.2.0",
     "jsonwebtoken": "^9.0.3",
     "mongoose": "^9.3.0",
-    "socket.io": "^4.8.3",
-    "uuid": "^13.0.0"
+    "pino": "^9.6.0",
+    "pino-http": "^10.4.0",
+    "pino-pretty": "^13.0.0",
+    "redis": "^4.7.0",
+    "socket.io": "^4.8.3"
+  },
+  "devDependencies": {
+    "eslint": "^8.57.1",
+    "jest": "^29.7.0"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "coverageDirectory": "coverage",
+    "collectCoverageFrom": [
+      "src/utils/**/*.js",
+      "!src/utils/logger.js"
+    ]
   }
 }

@@ -6,7 +6,7 @@ const OrderSchema = new mongoose.Schema({
   deliveryPartner: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   status: {
     type: String,
-    enum: ['PLACED', 'WAITING_WHOLESALER', 'ACCEPTED', 'PACKED', 'PICKED', 'OUT_FOR_DELIVERY', 'DELIVERED', 'REJECTED', 'FAILED'],
+    enum: ['PLACED', 'WAITING_WHOLESALER', 'ACCEPTED', 'PACKED', 'PICKED', 'OUT_FOR_DELIVERY', 'DELIVERED', 'REJECTED', 'FAILED', 'CANCELLED'],
     default: 'PLACED',
   },
   slot: { type: String, enum: ['Afternoon', 'Evening'], required: true },
@@ -16,6 +16,8 @@ const OrderSchema = new mongoose.Schema({
   packedAt: Date,
   pickedAt: Date,
   deliveredAt: Date,
+  cancelledAt: Date,
+  stockDeducted: { type: Boolean, default: false },
   deliveryOtp: String,
   billNumber: String,
   deliveryTracking: {

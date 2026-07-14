@@ -4,6 +4,7 @@ const User = require('../models/User');
 const Wholesaler = require('../models/Wholesaler');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const { issueTokenPair, rotateRefreshToken, hashToken } = require('../utils/tokens');
 const {
   VALID_ROLES,
   phoneDigits,
@@ -138,19 +139,49 @@ router.post('/login', async (req, res) => {
       return res.status(403).json({ success: false, message: 'Admin profile is not authorized' });
     }
 
-    const token = jwt.sign(
-      { id: user._id, role: user.role },
-      process.env.JWT_SECRET,
-      { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
-    );
+    const tokenPair = await issueTokenPair(user);
 
     res.json({
       success: true,
-      token,
+      token: tokenPair.accessToken,
+      accessToken: tokenPair.accessToken,
+      refreshToken: tokenPair.refreshToken,
+      expiresIn: tokenPair.expiresIn,
       user: publicUser(user),
     });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Login failed: ' + err.message });
+  }
+});
+
+router.post('/refresh', async (req, res) => {
+  const { refreshToken } = req.body;
+  if (!refreshToken) {
+    return res.status(400).json({ success: false, message: 'refreshToken is required' });
+  }
+
+  try {
+    const refreshTokenHash = hashToken(refreshToken);
+    const user = await User.findOne({ refreshTokenHash }).select('+refreshTokenHash +refreshTokenExpiresAt');
+    if (!user) {
+      return res.status(401).json({ success: false, message: 'Invalid refresh token' });
+    }
+
+    const tokenPair = await rotateRefreshToken(user, refreshToken);
+    if (!tokenPair) {
+      return res.status(401).json({ success: false, message: 'Invalid or expired refresh token' });
+    }
+
+    return res.json({
+      success: true,
+      token: tokenPair.accessToken,
+      accessToken: tokenPair.accessToken,
+      refreshToken: tokenPair.refreshToken,
+      expiresIn: tokenPair.expiresIn,
+      user: publicUser(user),
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: 'Token refresh failed: ' + err.message });
   }
 });
 

@@ -17,7 +17,18 @@ router.get('/search', auth, requireVerified, async (req, res) => {
         { category: { $regex: q, $options: 'i' } },
         { composition: { $regex: q, $options: 'i' } },
       ],
-    }).limit(100);
+    })
+      .skip((Math.max(1, Number(req.query.page) || 1) - 1) * Math.min(100, Math.max(1, Number(req.query.limit) || 20)))
+      .limit(Math.min(100, Math.max(1, Number(req.query.limit) || 20)));
+
+    const total = await Medicine.countDocuments({
+      $or: [
+        { name: { $regex: q, $options: 'i' } },
+        { company: { $regex: q, $options: 'i' } },
+        { category: { $regex: q, $options: 'i' } },
+        { composition: { $regex: q, $options: 'i' } },
+      ],
+    });
 
     const wholesalerMatches = await Wholesaler.find({
       'inventory.medicine': { $in: medicines.map((m) => m._id) },
@@ -56,6 +67,7 @@ router.get('/search', auth, requireVerified, async (req, res) => {
         company: med.company,
         category: med.category,
         composition: med.composition,
+        imageUrl: med.imageUrl || '',
         requiresPrescription: med.requiresPrescription,
         price: vendors[0]?.price || med.mrp,
         available: vendors.length > 0,
@@ -63,7 +75,16 @@ router.get('/search', auth, requireVerified, async (req, res) => {
       };
     });
 
-    return res.json({ success: true, medicines: result });
+    return res.json({
+      success: true,
+      medicines: result,
+      pagination: {
+        page: Math.max(1, Number(req.query.page) || 1),
+        limit: Math.min(100, Math.max(1, Number(req.query.limit) || 20)),
+        total,
+        pages: Math.ceil(total / Math.min(100, Math.max(1, Number(req.query.limit) || 20))),
+      },
+    });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message || 'Medicine search failed' });
   }
@@ -71,8 +92,19 @@ router.get('/search', auth, requireVerified, async (req, res) => {
 
 router.get('/', auth, requireRole('ADMIN'), async (req, res) => {
   try {
-    const medicines = await Medicine.find().sort({ name: 1 }).limit(500);
-    return res.json({ success: true, medicines });
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 20));
+    const skip = (page - 1) * limit;
+
+    const [medicines, total] = await Promise.all([
+      Medicine.find().sort({ name: 1 }).skip(skip).limit(limit),
+      Medicine.countDocuments(),
+    ]);
+    return res.json({
+      success: true,
+      medicines,
+      pagination: { page, limit, total, pages: Math.ceil(total / limit) },
+    });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -80,7 +112,7 @@ router.get('/', auth, requireRole('ADMIN'), async (req, res) => {
 
 router.post('/', auth, requireRole('ADMIN'), async (req, res) => {
   try {
-    const { name, company, category, mrp, composition, requiresPrescription } = req.body;
+    const { name, company, category, mrp, composition, requiresPrescription, imageUrl } = req.body;
     if (!name || !company || !mrp) {
       return res.status(400).json({ success: false, message: 'name, company, and mrp are required' });
     }
@@ -91,6 +123,7 @@ router.post('/', auth, requireRole('ADMIN'), async (req, res) => {
       category: category || 'General',
       mrp: Math.max(1, Number(mrp)),
       composition: composition || '',
+      imageUrl: imageUrl ? String(imageUrl).trim() : '',
       requiresPrescription: Boolean(requiresPrescription),
     });
 
@@ -105,12 +138,13 @@ router.put('/:id', auth, requireRole('ADMIN'), async (req, res) => {
     const medicine = await Medicine.findById(req.params.id);
     if (!medicine) return res.status(404).json({ success: false, message: 'Medicine not found' });
 
-    const { name, company, category, mrp, composition, requiresPrescription } = req.body;
+    const { name, company, category, mrp, composition, requiresPrescription, imageUrl } = req.body;
     if (name) medicine.name = String(name).trim();
     if (company) medicine.company = String(company).trim();
     if (category) medicine.category = category;
     if (mrp) medicine.mrp = Math.max(1, Number(mrp));
     if (composition !== undefined) medicine.composition = composition;
+    if (imageUrl !== undefined) medicine.imageUrl = String(imageUrl).trim();
     if (requiresPrescription !== undefined) medicine.requiresPrescription = Boolean(requiresPrescription);
 
     await medicine.save();

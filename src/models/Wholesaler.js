@@ -18,5 +18,6 @@ const WholesalerSchema = new mongoose.Schema({
 WholesalerSchema.index({ priorityRank: 1, createdAt: 1 });
 WholesalerSchema.index({ city: 1 });
 WholesalerSchema.index({ user: 1 }, { unique: true });
+WholesalerSchema.index({ location: '2dsphere' });
 
 module.exports = mongoose.model('Wholesaler', WholesalerSchema);

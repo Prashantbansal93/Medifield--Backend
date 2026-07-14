@@ -32,10 +32,13 @@ const UserSchema = new mongoose.Schema({
     lng: Number,
     adminCode: String,
   },
+  refreshTokenHash: { type: String, select: false },
+  refreshTokenExpiresAt: { type: Date, select: false },
   createdAt: { type: Date, default: Date.now },
 });
 
 UserSchema.index({ role: 1, verificationStatus: 1 });
 UserSchema.index({ 'profile.city': 1, role: 1 });
+UserSchema.index({ refreshTokenHash: 1 });
 
 module.exports = mongoose.model('User', UserSchema);

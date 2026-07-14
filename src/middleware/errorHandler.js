@@ -10,10 +10,9 @@ function errorHandler(err, req, res, next) {
 
   const status = err.status || err.statusCode || 500;
   const message = err.message || 'Internal server error';
+  const log = req.log || require('../utils/logger').logger;
 
-  if (process.env.NODE_ENV !== 'production') {
-    console.error(err);
-  }
+  log.error({ err, status, path: req.originalUrl, method: req.method }, 'Request error');
 
   res.status(status).json({
     success: false,

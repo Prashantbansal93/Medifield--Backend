@@ -6,6 +6,7 @@ const MedicineSchema = new mongoose.Schema({
   category: { type: String, default: 'General' },
   mrp: { type: Number, required: true, min: 1 },
   composition: { type: String, default: '' },
+  imageUrl: { type: String, default: '' },
   requiresPrescription: { type: Boolean, default: false },
   createdAt: { type: Date, default: Date.now },
 });

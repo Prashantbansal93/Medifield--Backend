@@ -7,17 +7,30 @@ const Medicine = require('../models/Medicine');
 const { auth, requireRole, requireVerified } = require('../middleware/auth');
 const { canTransitionStatus } = require('../utils/validation');
 const { emitOrderEvent } = require('../realtime');
+const { withTransaction } = require('../utils/transactions');
+const { notifyOrderEvent } = require('../utils/notifications');
 const {
   randomOtp,
   generateBillNumber,
   hydrateOrder,
+  attachEta,
   findAssignableDeliveryPartner,
   routeToWholesaler,
   deductInventory,
+  restoreInventory,
   redirectOrRejectOrder,
 } = require('../utils/orderHelpers');
 
 const waitMinutes = Number(process.env.WHOLESALER_WAIT_MINUTES) || 5;
+
+const CANCELLABLE_STATUSES = ['PLACED', 'WAITING_WHOLESALER', 'ACCEPTED', 'PACKED'];
+const STOCK_RESTORE_STATUSES = ['ACCEPTED', 'PACKED'];
+
+function serializeOrder(order, isRetailer) {
+  const obj = attachEta(order);
+  if (isRetailer) obj.wholesaler = undefined;
+  return obj;
+}
 
 router.post('/create', auth, requireRole('RETAILER'), requireVerified, async (req, res) => {
   try {
@@ -76,11 +89,13 @@ router.post('/create', auth, requireRole('RETAILER'), requireVerified, async (re
     });
 
     const updatedOrder = await hydrateOrder(order._id);
-    emitOrderEvent('order:created', updatedOrder);
+    const serialized = serializeOrder(updatedOrder, true);
+    emitOrderEvent('order:created', serialized);
+    await notifyOrderEvent(updatedOrder, 'WAITING_WHOLESALER');
     return res.json({
       success: true,
-      message: 'Order routed to priority wholesaler. Waiting for accept/reject.',
-      order: updatedOrder,
+      message: 'Order routed to nearest wholesaler. Waiting for accept/reject.',
+      order: serialized,
       waitWindowMinutes: waitMinutes,
     });
   } catch (err) {
@@ -106,45 +121,103 @@ router.post('/respond', auth, requireRole('WHOLESALER'), requireVerified, async 
     }
 
     if (action === 'accept') {
-      await deductInventory(userWholesaler._id, order.items);
+      try {
+        await withTransaction(async (session) => {
+          await deductInventory(userWholesaler._id, order.items, session);
 
-      const deliveryPartner = await findAssignableDeliveryPartner(userWholesaler.city);
-      const retailer = await User.findById(order.retailer);
-      const wholesalerLat = Number(userWholesaler.location?.coordinates?.[1]) || 26.91;
-      const wholesalerLng = Number(userWholesaler.location?.coordinates?.[0]) || 75.78;
-      const retailerLat = Number(retailer?.profile?.lat) || 26.915;
-      const retailerLng = Number(retailer?.profile?.lng) || 75.81;
+          const deliveryPartner = await findAssignableDeliveryPartner(userWholesaler.city);
+          const retailer = await User.findById(order.retailer);
+          const wholesalerLat = Number(userWholesaler.location?.coordinates?.[1]) || 26.91;
+          const wholesalerLng = Number(userWholesaler.location?.coordinates?.[0]) || 75.78;
+          const retailerLat = Number(retailer?.profile?.lat) || 26.915;
+          const retailerLng = Number(retailer?.profile?.lng) || 75.81;
 
-      const updates = {
-        status: 'ACCEPTED',
-        acceptedAt: new Date(),
-        deliveryOtp: randomOtp(),
-        billNumber: generateBillNumber(),
-        deliveryTracking: {
-          wholesalerLat,
-          wholesalerLng,
-          retailerLat,
-          retailerLng,
-          currentLat: wholesalerLat,
-          currentLng: wholesalerLng,
-        },
-      };
-      if (deliveryPartner) updates.deliveryPartner = deliveryPartner._id;
+          const updates = {
+            status: 'ACCEPTED',
+            acceptedAt: new Date(),
+            stockDeducted: true,
+            deliveryOtp: randomOtp(),
+            billNumber: generateBillNumber(),
+            deliveryTracking: {
+              wholesalerLat,
+              wholesalerLng,
+              retailerLat,
+              retailerLng,
+              currentLat: wholesalerLat,
+              currentLng: wholesalerLng,
+            },
+          };
+          if (deliveryPartner) updates.deliveryPartner = deliveryPartner._id;
 
-      await Order.findByIdAndUpdate(orderId, updates);
+          await Order.findByIdAndUpdate(orderId, updates, { session });
+        });
+      } catch (err) {
+        if (err.code === 'INSUFFICIENT_STOCK') {
+          const result = await redirectOrRejectOrder(order, waitMinutes);
+          await notifyOrderEvent(order, 'REDIRECTED', 'Stock taken by another order — redirected to next wholesaler.');
+          return res.status(409).json({
+            success: false,
+            message: 'Stock no longer available. Order redirected to next wholesaler.',
+            ...result,
+          });
+        }
+        throw err;
+      }
+
       const live = await hydrateOrder(orderId);
-      emitOrderEvent('order:updated', live);
-      return res.json({ success: true, message: 'Order accepted. Stock deducted and delivery assigned.', order: live });
+      const serialized = serializeOrder(live, false);
+      emitOrderEvent('order:updated', serialized);
+      await notifyOrderEvent(live, 'ACCEPTED');
+      return res.json({ success: true, message: 'Order accepted. Stock deducted and delivery assigned.', order: serialized });
     }
 
     if (action === 'reject') {
       const result = await redirectOrRejectOrder(order, waitMinutes);
+      await notifyOrderEvent(order, 'REDIRECTED', 'Wholesaler rejected — order redirected.');
       return res.json({ success: true, message: result.message });
     }
 
     return res.status(400).json({ success: false, message: 'Invalid action. Use accept or reject.' });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message || 'Order response failed' });
+  }
+});
+
+router.post('/cancel', auth, requireRole('RETAILER'), requireVerified, async (req, res) => {
+  try {
+    const { orderId } = req.body;
+    const order = await Order.findById(orderId);
+    if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
+    if (String(order.retailer) !== String(req.user.id)) {
+      return res.status(403).json({ success: false, message: 'You can only cancel your own orders' });
+    }
+    if (!CANCELLABLE_STATUSES.includes(order.status)) {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot cancel order in ${order.status} status. Cancellation allowed before pickup.`,
+      });
+    }
+
+    const shouldRestore = order.stockDeducted || STOCK_RESTORE_STATUSES.includes(order.status);
+
+    await withTransaction(async (session) => {
+      if (shouldRestore && order.wholesaler) {
+        await restoreInventory(order.wholesaler, order.items, session);
+      }
+      await Order.findByIdAndUpdate(
+        orderId,
+        { status: 'CANCELLED', cancelledAt: new Date(), deliveryPartner: null },
+        { session }
+      );
+    });
+
+    const live = await hydrateOrder(orderId);
+    const serialized = serializeOrder(live, true);
+    emitOrderEvent('order:updated', serialized);
+    await notifyOrderEvent(live, 'CANCELLED', 'Retailer cancelled the order.');
+    return res.json({ success: true, message: 'Order cancelled successfully', order: serialized });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message || 'Cancellation failed' });
   }
 });
 
@@ -167,8 +240,10 @@ router.post('/pack', auth, requireRole('WHOLESALER'), requireVerified, async (re
 
     await Order.findByIdAndUpdate(orderId, { status: 'PACKED', packedAt: new Date() });
     const live = await hydrateOrder(orderId);
-    emitOrderEvent('order:updated', live);
-    return res.json({ success: true, message: 'Order marked as packed', order: live });
+    const serialized = serializeOrder(live, false);
+    emitOrderEvent('order:updated', serialized);
+    await notifyOrderEvent(live, 'PACKED');
+    return res.json({ success: true, message: 'Order marked as packed', order: serialized });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -215,8 +290,10 @@ router.post('/update-status', auth, requireVerified, async (req, res) => {
 
     await Order.findByIdAndUpdate(orderId, updates);
     const live = await hydrateOrder(orderId);
-    emitOrderEvent('order:updated', live);
-    return res.json({ success: true, message: 'Order status updated', order: live });
+    const serialized = serializeOrder(live, req.user.role === 'RETAILER');
+    emitOrderEvent('order:updated', serialized);
+    if (status) await notifyOrderEvent(live, status);
+    return res.json({ success: true, message: 'Order status updated', order: serialized });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message || 'Status update failed' });
   }
@@ -224,32 +301,47 @@ router.post('/update-status', auth, requireVerified, async (req, res) => {
 
 router.get('/', auth, requireVerified, async (req, res) => {
   try {
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 20));
+    const skip = (page - 1) * limit;
+
     const query = {};
     if (req.user.role === 'RETAILER') query.retailer = req.user.id;
     if (req.user.role === 'WHOLESALER') {
       const wholesaler = await Wholesaler.findOne({ user: req.user.id });
-      if (!wholesaler) return res.json({ success: true, orders: [] });
+      if (!wholesaler) {
+        return res.json({
+          success: true,
+          orders: [],
+          pagination: { page, limit, total: 0, pages: 0 },
+        });
+      }
       query.wholesaler = wholesaler._id;
     }
     if (req.user.role === 'DELIVERY') query.deliveryPartner = req.user.id;
 
-    const orders = await Order.find(query)
-      .sort({ createdAt: -1 })
-      .populate('retailer', 'name phone')
-      .populate({
-        path: 'wholesaler',
-        populate: { path: 'user', select: 'name phone profile.shopAddress' },
-      })
-      .populate('deliveryPartner', 'name phone')
-      .populate('items.medicine', 'name company');
+    const [orders, total] = await Promise.all([
+      Order.find(query)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .populate('retailer', 'name phone')
+        .populate({
+          path: 'wholesaler',
+          populate: { path: 'user', select: 'name phone profile.shopAddress' },
+        })
+        .populate('deliveryPartner', 'name phone')
+        .populate('items.medicine', 'name company imageUrl'),
+      Order.countDocuments(query),
+    ]);
 
     const isRetailer = req.user.role === 'RETAILER';
-    const safeOrders = orders.map((order) => {
-      const obj = order.toObject();
-      if (isRetailer) obj.wholesaler = undefined;
-      return obj;
+    const safeOrders = orders.map((order) => serializeOrder(order, isRetailer));
+    return res.json({
+      success: true,
+      orders: safeOrders,
+      pagination: { page, limit, total, pages: Math.ceil(total / limit) },
     });
-    return res.json({ success: true, orders: safeOrders });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message || 'Could not fetch orders' });
   }
@@ -270,9 +362,10 @@ router.get('/:id', auth, requireVerified, async (req, res) => {
       return res.status(403).json({ success: false, message: 'Access denied' });
     }
 
-    const obj = order.toObject();
-    if (req.user.role === 'RETAILER') obj.wholesaler = undefined;
-    return res.json({ success: true, order: obj });
+    return res.json({
+      success: true,
+      order: serializeOrder(order, req.user.role === 'RETAILER'),
+    });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
   }
